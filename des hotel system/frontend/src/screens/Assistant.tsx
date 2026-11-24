@@ -1,0 +1,944 @@
+import { useCallback, useEffect, useRef, useState } from "react"
+import { Link, useLocation, useOutletContext } from "react-router-dom"
+import {
+  LayoutGrid,
+  Loader2,
+  MessageSquare,
+  Minus,
+  Plus,
+  Send,
+  Sparkles,
+  Trash2,
+  Wrench,
+} from "lucide-react"
+
+import {
+  call,
+  createConversation,
+  deleteConversation,
+  getBookingOptions,
+  getConversation,
+  getCurrentProperty,
+  getSnapshot,
+  listConversations,
+  postRaw,
+  saveConversation,
+  serverError,
+  type BookingOptions,
+  type ChatMsg,
+  type ConversationSummary,
+  type Snapshot,
+} from "../lib/api"
+import { agentFailureText, fold, isBasketClear, isBasketClose, spokenHitsChoice } from "../lib/agentMatch"
+import { cn } from "../lib/utils"
+import { cur, moneyLocale } from "../lib/money"
+import { Markdown } from "../lib/markdown"
+import AgentCards, { type AgentCard } from "../components/AgentCards"
+import {
+  flows,
+  menuChoices,
+  menuTiles,
+  splitOptions,
+  startOver,
+  type Answers,
+  type Choice,
+  type FlowId,
+  fitsStep,
+  BASKET_CLEAR,
+  BASKET_DONE,
+  orderFromAnswers,
+  readCart,
+  writeCart,
+  type CartLine,
+  type GuideData,
+  type GuideMenu,
+  type GuideOutlet,
+  type Outcome,
+} from "../components/AgentGuide"
+import VoiceButton, { agentLang, voiceSupported, type VoiceHandle } from "../components/VoiceButton"
+import type { ShellContext } from "../AppShell"
+import { t as translate, useUILanguage } from "../lib/i18n"
+
+const TOOL_LABEL: Record<string, string> = {
+  availability: "Checked availability",
+  quote: "Priced the stay",
+  create_booking: "Created a booking",
+  check_in: "Checked in",
+  check_out: "Checked out",
+  post_charge: "Posted a charge",
+  take_payment: "Recorded a payment",
+  find_reservations: "Looked up reservations",
+  stay_detail: "Opened a stay",
+  cancel_reservation: "Cancelled a booking",
+  owner_briefing: "Read the day's numbers",
+  front_desk_today: "Checked today's desk",
+  waitlist_ready: "Checked waitlist openings",
+  promote_waitlist: "Promoted from waitlist",
+  booking_options: "Read booking options",
+  checkout_context: "Read the check-out bill",
+  get_folio: "Opened the folio",
+  record_payment: "Recorded a payment",
+  cancellation_preview: "Priced the cancellation",
+  cancel_booking: "Cancelled a booking",
+  waive_security_deposit: "Waived the deposit",
+  collect_security_deposit: "Took the deposit",
+  security_deposit_status: "Read the deposit",
+  raise_ticket: "Raised a ticket",
+  hk_queue: "Read housekeeping",
+}
+const toolLabel = (t: string) =>
+  TOOL_LABEL[t] ?? t.replace(/_/g, " ")
+
+const SUGGESTIONS = [
+  "What does today look like - arrivals, departures, occupancy?",
+  "Find the reservation for room 101 and show me the folio.",
+  "Quote 2 nights in a Deluxe for 2 adults from this Friday.",
+  "Which waitlisted guests can I now give a room?",
+]
+
+// one tap above the box: the desk's most common tasks, then the full list
+const SHORTCUT_FLOWS: FlowId[] = ["walkin", "checkin", "checkout", "booking", "order", "payment", "today"]
+
+// "check in", "Check-in" and "check in." all name the same task
+const norm = fold
+
+type FlowState = { id: FlowId; step: number; answers: Answers }
+
+function ThinkingDots() {
+  useUILanguage()
+  return (
+    <span className="inline-flex items-center gap-1.5 text-sm text-zinc-500">{translate("Thinking")}<span className="inline-flex gap-0.5">
+        <span className="size-1.5 animate-bounce rounded-full bg-zinc-400 [animation-delay:0ms]" />
+        <span className="size-1.5 animate-bounce rounded-full bg-zinc-400 [animation-delay:150ms]" />
+        <span className="size-1.5 animate-bounce rounded-full bg-zinc-400 [animation-delay:300ms]" />
+      </span>
+    </span>
+  )
+}
+
+function ChoiceButtons(props: {
+  choices: Choice[]
+  live: boolean
+  busy: boolean
+  onPick: (c: Choice) => void
+}) {
+  const button = (c: Choice, j: number) => (
+    <button
+      key={`${c.group ?? ""}-${c.label}-${j}`}
+      type="button"
+      disabled={!props.live || props.busy}
+      onClick={() => props.onPick(c)}
+      className={cn(
+        "rounded-xl border px-3 py-1.5 text-left text-sm transition disabled:cursor-default",
+        c.goto === "menu"
+          ? "border-transparent text-zinc-500 hover:text-zinc-800"
+          : "border-brand-200 bg-white text-zinc-800 shadow-sm hover:border-brand-400 hover:bg-brand-50",
+      )}
+    >
+      <span className="block font-medium">{c.label}</span>
+      {c.hint && <span className="block text-xs text-zinc-500">{c.hint}</span>}
+    </button>
+  )
+  const loose = props.choices.filter((c) => !c.group)
+  const groups: { name: string; items: Choice[] }[] = []
+  for (const c of props.choices) {
+    if (!c.group) continue
+    const found = groups.find((g) => g.name === c.group)
+    if (found) found.items.push(c)
+    else groups.push({ name: c.group, items: [c] })
+  }
+  return (
+    <div className="space-y-2">
+      {loose.length > 0 && <div className="flex flex-wrap gap-1.5">{loose.map(button)}</div>}
+      {groups.map((g) => (
+        <div key={g.name}>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-zinc-400">{g.name}</div>
+          <div className="flex flex-wrap gap-1.5">{g.items.map(button)}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+export default function Assistant() {
+  useUILanguage()
+  const [convos, setConvos] = useState<ConversationSummary[]>([])
+  const [activeId, setActiveId] = useState<string | null>(null)
+  const [msgs, setMsgs] = useState<ChatMsg[]>([])
+  const [input, setInput] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // the provider refused for money: the error gets a link to the AI settings
+  const [noCredit, setNoCredit] = useState(false)
+  const endRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const voiceRef = useRef<VoiceHandle>(null)
+  const [aiEnabled, setAiEnabled] = useState<boolean | null>(null)
+  const shell = useOutletContext<ShellContext | undefined>()
+
+  // msgs mirrored in a ref so a guided step can add a message and send
+  // to the AI in the same tick without reading stale state
+  const msgsRef = useRef<ChatMsg[]>([])
+  const setAll = (next: ChatMsg[]) => {
+    msgsRef.current = next
+    setMsgs(next)
+  }
+  const push = (...m: ChatMsg[]) => setAll([...msgsRef.current, ...m])
+
+  // the guided task in progress, if any (components/AgentGuide)
+  const [flow, setFlowState] = useState<FlowState | null>(null)
+  const flowRef = useRef<FlowState | null>(null)
+  const setFlow = (f: FlowState | null) => {
+    flowRef.current = f
+    setFlowState(f)
+  }
+  const [stepping, setStepping] = useState(false)
+  // today's board, the booking options, outlets and menus, fetched once per task
+  const cache = useRef<{
+    snap?: Promise<Snapshot>
+    opts?: Promise<BookingOptions>
+    outlets?: Promise<GuideOutlet[]>
+    menus?: Record<string, Promise<GuideMenu>>
+  }>({})
+  const data: GuideData = {
+    snapshot: () => (cache.current.snap ??= getSnapshot()),
+    options: () => (cache.current.opts ??= getBookingOptions()),
+    outlets: () =>
+      (cache.current.outlets ??= call<GuideOutlet[]>("DezPMS.pos.outlets", { property: getCurrentProperty() })),
+    menu: (outlet) =>
+      ((cache.current.menus ??= {})[outlet] ??= call<GuideMenu>("DezPMS.pos.pos_menu", { outlet })),
+  }
+
+  async function runStep(f: FlowState) {
+    const def = flows()[f.id]
+    // questions that don't apply to this answer set are passed over
+    while (f.step < def.steps.length && def.steps[f.step].skip?.(f.answers)) f = { ...f, step: f.step + 1 }
+    if (f.step >= def.steps.length) {
+      setFlow(null)
+      return finish(def.finish(f.answers, aiEnabled !== false))
+    }
+    setFlow(f)
+    setStepping(true)
+    try {
+      const step = def.steps[f.step]
+      const { ask, choices, auto } = await step.load(f.answers, data)
+      // one possible answer (a hotel with one kitchen): taken, not asked
+      if (auto) return runStep({ ...f, step: f.step + 1, answers: { ...f.answers, [step.key]: auto } })
+      push({ role: "assistant", content: ask, choices: [...choices, startOver()] })
+    } catch {
+      cache.current = {}
+      push({
+        role: "assistant",
+        content: translate("I couldn't load that list. Type the answer instead."),
+        choices: [startOver()],
+      })
+    } finally {
+      setStepping(false)
+      setTimeout(() => inputRef.current?.focus(), 0)
+    }
+  }
+
+  function startFlow(id: FlowId | "menu", label?: string) {
+    if (busy) return
+    setError(null)
+    if (label) push({ role: "user", content: label })
+    if (id === "menu") {
+      setFlow(null)
+      push({ role: "assistant", content: translate("What would you like to do? Tap one."), choices: menuChoices() })
+      return
+    }
+    cache.current = {}
+    runStep({ id, step: 0, answers: {} })
+  }
+
+  function answer(value: string, label: string, typed = false) {
+    const f = flowRef.current
+    if (!f) return
+    const step = flows()[f.id].steps[f.step]
+    push({ role: "user", content: label || translate("Skip") })
+    const picked = { label, value, typed }
+    if (step.collect) {
+      // a basket (food order): add to it and ask again until Done
+      const next = step.collect(f.answers[step.key], picked)
+      if (next) return runStep({ ...f, answers: { ...f.answers, [step.key]: next } })
+      return runStep({ ...f, step: f.step + 1 })
+    }
+    runStep({ ...f, step: f.step + 1, answers: { ...f.answers, [step.key]: picked } })
+  }
+
+  // the guide sends a food order itself - the same call the POS till makes.
+  // the basket stays open until the kitchen has accepted it
+  async function placeOrder(c: Choice) {
+    if (!c.order) return
+    push({ role: "user", content: c.label })
+    setStepping(true)
+    try {
+      const r = await call<{ order: string; order_total: number }>("DezPMS.pos.send_order", {
+        ...c.order,
+        allow_zero: c.order.allow_zero ? 1 : 0,
+        property: getCurrentProperty(),
+      })
+      setFlow(null)
+      push({
+        role: "assistant",
+        content: translate("Sent to the kitchen. Order {order}, total {total}.", {
+          order: r.order,
+          total: `${cur()}${Number(r.order_total || 0).toLocaleString(moneyLocale())}`,
+        }),
+        choices: [{ label: translate("Another food order"), goto: "order" }, startOver()],
+      })
+    } catch (e) {
+      const reason = serverError(e)
+      const free = !c.order.allow_zero && /no price/i.test(reason)
+      push({
+        role: "assistant",
+        content: free
+          ? reason
+          : translate("The order didn't go through: {reason}", { reason }),
+        choices: free
+          ? [
+              { label: translate("Send them free"), order: { ...c.order, allow_zero: true } },
+              startOver(),
+            ]
+          : [{ label: translate("Try again"), goto: "order" }, startOver()],
+      })
+    } finally {
+      setStepping(false)
+    }
+  }
+
+  function finish(o: Outcome) {
+    if ("prompt" in o) {
+      if (aiEnabled === false) {
+        push({ role: "assistant", content: translate("This step needs the AI. Add an AI key in Settings → AI assistant."), choices: [startOver()] })
+        return
+      }
+      send(o.prompt)
+      return
+    }
+    push({ role: "assistant", content: o.say, cards: o.cards, choices: o.choices })
+  }
+
+  function pick(c: Choice) {
+    if (busy || stepping) return
+    if (c.goto) return startFlow(c.goto, c.label)
+    if (c.book) {
+      push({ role: "user", content: c.label })
+      setFlow(null)
+      shell?.openBooking(c.book)
+      return
+    }
+    if (c.order) return placeOrder(c)
+    if (c.prompt !== undefined) return send(c.prompt)
+    if (c.value !== undefined && flowRef.current) return answer(c.value, c.label)
+    // an option the AI offered: sent back as the reply
+    send(c.label)
+  }
+
+  function closePhrases() {
+    return [translate("Done"), translate("Send to the kitchen"), translate("Complete the order")]
+  }
+
+  function liveChoices(): Choice[] {
+    for (let i = msgsRef.current.length - 1; i >= 0; i--) {
+      const choices = msgsRef.current[i].choices
+      if (choices?.length) return choices
+    }
+    return []
+  }
+
+  function submit(text: string) {
+    const q = text.trim()
+    const f = flowRef.current
+    if (!q || busy || stepping) return
+    const step = f && flows()[f.id].steps[f.step]
+    // a food-order basket does not need the AI. "complete the order" is Done.
+    if (step?.collect && isBasketClear(q, [translate("Clear the order")])) {
+      setInput("")
+      return answer(BASKET_CLEAR, translate("Clear the order"), true)
+    }
+    if (step?.collect && isBasketClose(q, closePhrases())) {
+      setInput("")
+      return answer(BASKET_DONE, translate("Done"), true)
+    }
+    if (step && fitsStep(step, q)) {
+      setInput("")
+      return answer(q, q, true)
+    }
+    // a tap-only question: typing (or saying) one of the answers counts as
+    // tapping it - the guest's name, the dish, or the room number under it
+    const open = liveChoices()
+    const said = norm(q)
+    const hit = said && open.find((c) =>
+      (f ? c.value !== undefined || !!(c.order || c.goto || c.book) : !!(c.goto || c.order || c.book)) &&
+      spokenHitsChoice(said, c.label, c.hint))
+    if (hit) {
+      setInput("")
+      return pick(hit)
+    }
+    // no task open: naming one ("check in", "food order") starts it
+    const tile = !f && menuTiles().find((tl) => norm(tl.label) === said)
+    if (tile) {
+      setInput("")
+      return startFlow(tile.id, tile.label)
+    }
+    // a guided task is still open: keep it. A typed aside must not throw
+    // the basket away and hand the sentence to an AI call that can fail.
+    if (f) {
+      setInput("")
+      push({ role: "user", content: q })
+      push({
+        role: "assistant",
+        content: translate("That isn't one of the choices. Tap one below, or type its name."),
+        choices: open.filter((c) => c.value !== undefined || c.goto || c.order || c.book),
+      })
+      return
+    }
+    if (aiEnabled === false) {
+      setError(translate("Add an AI key in Settings to ask in your own words. The tasks above work without it."))
+      return
+    }
+    send(q)
+  }
+  // a screen can hand the agent a ready question (End of Day blockers);
+  // it is put in the box for the user to read and send, not sent for them
+  const handoffState = useLocation().state as { prompt?: string; property?: string } | null
+  const handoff = handoffState?.prompt
+  // the question is about the property the screen was showing (Night Audit
+  // lists every property), not whichever one the header switcher holds
+  const chatProperty = handoffState?.property || getCurrentProperty()
+  useEffect(() => {
+    if (handoff) setInput(handoff)
+  }, [handoff])
+
+  useEffect(() => {
+    call<{ enabled: boolean }>("DezPMS.assistant.assistant_status", {
+      property: chatProperty,
+    })
+      .then((s) => setAiEnabled(s.enabled))
+      .catch(() => setAiEnabled(true))
+  }, [])
+
+  const refreshList = useCallback(
+    () => listConversations().then(setConvos).catch(() => setConvos([])),
+    [],
+  )
+
+  useEffect(() => {
+    refreshList()
+  }, [refreshList])
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+  }, [msgs, busy])
+
+  async function openConvo(name: string) {
+    if (busy) return
+    setError(null)
+    try {
+      const c = await getConversation(name)
+      setActiveId(c.name)
+      setFlow(null)
+      setAll(c.messages)
+    } catch {
+      setError(translate("Couldn't open that conversation."))
+    }
+  }
+
+  function newChat() {
+    if (busy) return
+    setActiveId(null)
+    setFlow(null)
+    setAll([])
+    setError(null)
+  }
+
+  async function removeConvo(name: string, e: React.MouseEvent) {
+    e.stopPropagation()
+    await deleteConversation(name).catch(() => {})
+    setConvos((cs) => cs.filter((c) => c.name !== name))
+    if (activeId === name) newChat()
+  }
+
+  async function send(text: string) {
+    const q = text.trim()
+    if (!q || busy) return
+    setInput("")
+    setError(null)
+    setNoCredit(false)
+    // a guided task stays until this call has actually succeeded
+    const guided = flowRef.current
+    const isFirst = !activeId
+    // the AI reads only what was said; old tap buttons stay on screen
+    const history: ChatMsg[] = [...msgsRef.current, { role: "user", content: q }]
+    const aIdx = history.length
+    setAll([...history, { role: "assistant", content: "", actions: [] }])
+    setBusy(true)
+    const patch = (fn: (m: ChatMsg) => ChatMsg) =>
+      setAll(msgsRef.current.map((m, i) => (i === aIdx ? fn(m) : m)))
+
+    let content = ""
+    let streamError = ""
+    const actions: { tool: string; ok: boolean }[] = []
+    const cards: AgentCard[] = []
+    try {
+      let convId = activeId
+      if (!convId) {
+        const c = await createConversation(q.slice(0, 60))
+        convId = c.name
+        setActiveId(convId)
+        setConvos((cs) => [
+          { name: c.name, title: c.title, modified: "" },
+          ...cs,
+        ])
+      }
+
+      const res = await postRaw("/api/method/DezPMS.assistant.ask_stream", {
+        property: chatProperty,
+        messages: history.map(({ role, content }) => ({ role, content })),
+        lang: agentLang(),
+      })
+      if (!res.ok || !res.body) {
+        const body = await res.text().catch(() => "")
+        throw Object.assign(new Error(serverError({ status: res.status, body })), { status: res.status })
+      }
+      const reader = res.body.getReader()
+      const dec = new TextDecoder()
+      let buf = ""
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        let sep: number
+        while ((sep = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, sep)
+          buf = buf.slice(sep + 2)
+          let event = ""
+          let data = ""
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim()
+            else if (line.startsWith("data:")) data = line.slice(5).trim()
+          }
+          if (!event || !data) continue
+          const d = JSON.parse(data)
+          if (event === "token") {
+            content += d.text
+            patch((m) => ({ ...m, content }))
+          } else if (event === "action") {
+            actions.push({ tool: d.tool, ok: d.ok })
+            patch((m) => ({ ...m, actions: [...actions] }))
+          } else if (event === "card") {
+            cards.push(d as AgentCard)
+            patch((m) => ({ ...m, cards: [...cards] }))
+          } else if (event === "error") {
+            streamError = String(d.message || "")
+            setNoCredit(d.code === "out_of_credit")
+          }
+        }
+      }
+      const failure = streamError ? agentFailureText(streamError) : null
+      if (failure) {
+        setError(failure.text)
+        if (failure.credit) setNoCredit(true)
+        // the question's buttons stay tappable: drop the failed turn
+        if (guided) {
+          setAll(msgsRef.current.filter((_, i) => i !== aIdx && i !== aIdx - 1))
+          setFlow(guided)
+        } else if (!content) {
+          setAll(msgsRef.current.filter((_, i) => i !== aIdx))
+        }
+        return
+      }
+      setFlow(null)
+      // persist the completed turn
+      const finalMsgs: ChatMsg[] = [
+        ...history,
+        { role: "assistant", content, actions, cards },
+      ]
+      await saveConversation(
+        convId,
+        finalMsgs,
+        isFirst ? q.slice(0, 60) : undefined,
+      )
+      if (isFirst) refreshList()
+    } catch (e) {
+      const failure = agentFailureText(e instanceof Error ? e.message : "")
+      setError(failure.text)
+      if (failure.credit) setNoCredit(true)
+      if (guided) {
+        setAll(msgsRef.current.filter((_, i) => i !== aIdx && i !== aIdx - 1))
+        setFlow(guided)
+      } else if (!content) {
+        setAll(msgsRef.current.filter((_, i) => i !== aIdx))
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function setQty(item: string, qty: number) {
+    const f = flowRef.current
+    if (!f || busy || stepping) return
+    const step = flows()[f.id].steps[f.step]
+    if (!step?.collect) return
+    const cart = readCart(f.answers[step.key]).flatMap((l) => {
+      if (l.item !== item) return [l]
+      if (qty < 1) return []
+      return [{ ...l, qty }]
+    })
+    runStep({ ...f, answers: { ...f.answers, [step.key]: writeCart(cart) } })
+  }
+
+  function sendBasket() {
+    const f = flowRef.current
+    if (!f || busy || stepping) return
+    const built = orderFromAnswers(f.answers)
+    if (!built) return
+    placeOrder({ label: translate("Send to the kitchen"), order: built.order })
+  }
+
+  const stepNow = flow ? flows()[flow.id].steps[flow.step] : undefined
+  const basketLines: CartLine[] | null = stepNow?.collect && flow
+    ? readCart(flow.answers[stepNow.key])
+    : null
+  let liveChoiceAt = -1
+  msgs.forEach((m, i) => {
+    if (m.role === "assistant" && m.choices?.length) liveChoiceAt = i
+  })
+  const chatLocked = aiEnabled === false && !flow
+
+  return (
+    // fills the viewport under the top bar + page header; only panes scroll
+    <div className="flex h-[calc(100dvh-11rem)] min-h-[440px] gap-4">
+      {/* conversations */}
+      <div className="hidden w-60 shrink-0 flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm md:flex">
+        <div className="border-b border-zinc-100 p-2">
+          <button
+            onClick={newChat}
+            disabled={busy}
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-200 px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+          >
+            <Plus className="size-4" />{translate(" New chat")}</button>
+        </div>
+        <div className="flex-1 space-y-0.5 overflow-y-auto p-2">
+          {convos.length === 0 && (
+            <div className="flex flex-col items-center gap-2 px-3 py-10 text-center">
+              <MessageSquare className="size-5 text-zinc-300" aria-hidden />
+              <p className="text-xs text-zinc-400">{translate("Your chats will show up here.")}</p>
+            </div>
+          )}
+          {convos.map((c) => (
+            <div
+              key={c.name}
+              onClick={() => openConvo(c.name)}
+              className={cn(
+                "group flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm",
+                activeId === c.name
+                  ? "bg-brand-50 text-brand-800"
+                  : "text-zinc-600 hover:bg-zinc-50",
+              )}
+            >
+              <span className="flex-1 truncate">{c.title || translate("Untitled")}</span>
+              <button
+                onClick={(e) => removeConvo(c.name, e)}
+                aria-label={translate("Delete conversation")}
+                className="opacity-0 group-hover:opacity-100"
+              >
+                <Trash2 className="size-3.5 text-zinc-400 hover:text-rose-500" />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* chat */}
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm">
+        <div className="flex items-center gap-2 border-b border-zinc-100 px-4 py-2.5 text-xs text-zinc-500">
+          <span
+            className={cn(
+              "size-2 rounded-full",
+              aiEnabled === false ? "bg-zinc-300" : "bg-brand-500",
+            )}
+            aria-hidden
+          />
+          <span className="truncate">
+            {aiEnabled === false ? translate("Not set up") : translate("Acting as you")} ·{" "}
+            <span className="font-medium text-zinc-700">
+              {chatProperty?.split("-")[0] ?? translate("your hotel")}
+            </span>
+          </span>
+        </div>
+
+        <div className="flex-1 space-y-4 overflow-y-auto px-4 py-5">
+          {msgs.length === 0 && (
+            <div className="mx-auto max-w-3xl space-y-3 py-4 text-center">
+              <Sparkles className="mx-auto size-8 text-brand-500" />
+              <h2 className="text-lg font-semibold">{translate("What would you like to do?")}</h2>
+              <p className="text-sm text-zinc-500">
+                {aiEnabled === false
+                  ? translate("Tap a task and I'll ask you one thing at a time. Asking in your own words needs an AI key.")
+                  : translate("Tap a task and I'll ask you one thing at a time. Or just type what you need.")}
+              </p>
+              {aiEnabled === false && (
+                <Link to="/settings/ai" className="inline-flex text-sm font-medium text-brand-700 underline">
+                  {translate("Open AI settings")}
+                </Link>
+              )}
+              <div className="grid grid-cols-2 gap-2 pt-2 sm:grid-cols-3 lg:grid-cols-4">
+                {menuTiles().map((tl) => (
+                  <button
+                    key={tl.id}
+                    onClick={() => startFlow(tl.id, tl.label)}
+                    className="flex items-start gap-2.5 rounded-xl border border-zinc-200 bg-white px-3 py-3 text-left shadow-sm transition hover:border-brand-400 hover:bg-brand-50/40"
+                  >
+                    <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-brand-50 ring-1 ring-brand-100">
+                      <tl.icon className="size-4 text-brand-600" aria-hidden />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-zinc-900">{tl.label}</span>
+                      <span className="block text-xs text-zinc-500">{tl.hint}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+              {aiEnabled !== false && (
+                <>
+                  <p className="pt-3 text-xs font-medium uppercase tracking-wide text-zinc-400">{translate("Or ask in your own words")}</p>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {SUGGESTIONS.map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => send(translate(s))}
+                        className="rounded-lg border border-zinc-200 px-3 py-2 text-left text-sm text-zinc-600 hover:border-brand-400 hover:bg-zinc-50"
+                      >
+                        {translate(s)}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+          {msgs.map((m, i) => {
+            const last = i === msgs.length - 1
+            const { text, options } =
+              m.role === "assistant" ? splitOptions(m.content) : { text: m.content, options: [] }
+            const choices: Choice[] =
+              m.choices ?? (last && !busy ? options.map((o) => ({ label: o })) : [])
+            return (
+            <div key={i} className="space-y-2">
+            <div
+              className={cn(
+                "flex items-end gap-2",
+                m.role === "user" ? "justify-end" : "justify-start",
+              )}
+            >
+              {m.role === "assistant" && (
+                <span className="mb-1 flex size-7 shrink-0 items-center justify-center rounded-full bg-brand-600/10">
+                  <Sparkles className="size-3.5 text-brand-600" aria-hidden />
+                </span>
+              )}
+              <div
+                className={cn(
+                  "max-w-[75%] rounded-2xl px-4 py-2.5 text-sm shadow-sm",
+                  m.role === "user"
+                    ? "whitespace-pre-wrap rounded-br-md bg-brand-600 text-white"
+                    : "space-y-2 rounded-bl-md border border-zinc-100 bg-white text-zinc-800",
+                )}
+              >
+                {m.role === "assistant" ? (
+                  <>
+                    {m.actions && m.actions.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5">
+                        {m.actions.map((a, j) => (
+                          <span
+                            key={j}
+                            className={cn(
+                              "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px]",
+                              a.ok
+                                ? "bg-emerald-100 text-emerald-700"
+                                : "bg-rose-100 text-rose-700",
+                            )}
+                          >
+                            <Wrench className="size-3" />
+                            {translate(toolLabel(a.tool))}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {text ? (
+                      <Markdown text={text} />
+                    ) : (
+                      busy && <ThinkingDots />
+                    )}
+                  </>
+                ) : (
+                  m.content
+                )}
+              </div>
+            </div>
+            {m.role === "assistant" && m.cards && m.cards.length > 0 && (
+              <div className="ms-9 max-w-[75%]">
+                <AgentCards cards={m.cards} />
+              </div>
+            )}
+            {m.role === "assistant" && choices.length > 0 && (
+              // the open question stays tappable after a failed AI send
+              <div className={cn("ms-9 max-w-[85%]", !(flow ? i === liveChoiceAt : last) && "opacity-50")}>
+                <ChoiceButtons
+                  choices={choices}
+                  live={flow ? i === liveChoiceAt : last}
+                  busy={busy || stepping}
+                  onPick={pick}
+                />
+              </div>
+            )}
+            </div>
+            )
+          })}
+          {stepping && (
+            <div className="ms-9">
+              <ThinkingDots />
+            </div>
+          )}
+          {error && (
+            <p className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-600">
+              {translate(error)}
+              {noCredit && (
+                <Link to="/settings/ai" className="ms-2 font-medium underline">
+                  {translate("Open AI settings")}
+                </Link>
+              )}
+            </p>
+          )}
+          <div ref={endRef} />
+        </div>
+
+        <div className="flex flex-wrap gap-1.5 border-t border-zinc-100 px-3 pt-2.5">
+            <button
+              type="button"
+              disabled={busy || stepping}
+              onClick={() => startFlow("menu", translate("All tasks"))}
+              className="inline-flex shrink-0 items-center gap-1 rounded-full border border-brand-200 bg-brand-50 px-3 py-1 text-xs font-medium text-brand-700 hover:border-brand-300 disabled:opacity-50"
+            >
+              <LayoutGrid className="size-3.5" aria-hidden />
+              {translate("All tasks")}
+            </button>
+            {menuTiles()
+              .filter((tl) => SHORTCUT_FLOWS.includes(tl.id))
+              .map((tl) => (
+                <button
+                  key={tl.id}
+                  type="button"
+                  disabled={busy || stepping}
+                  onClick={() => startFlow(tl.id, tl.label)}
+                  className="shrink-0 rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-medium text-zinc-700 hover:border-brand-300 hover:bg-brand-50 hover:text-brand-700 transition-colors shadow-xs disabled:opacity-50"
+                >
+                  {tl.label}
+                </button>
+              ))}
+          </div>
+        {basketLines && (
+          <div className="border-t border-zinc-100 px-3 py-2">
+            <div className="mb-1 flex items-center justify-between text-sm">
+              <span className="font-medium text-zinc-800">{translate("In the order")}</span>
+              <span className="tabular-nums text-zinc-700">
+                {cur()}{basketLines.reduce((s, l) => s + l.qty * l.price, 0).toLocaleString(moneyLocale())}
+              </span>
+            </div>
+            {basketLines.length === 0 && (
+              <p className="text-xs text-zinc-500">{translate("Tap a dish. Done and Send stay here.")}</p>
+            )}
+            <ul className="max-h-28 space-y-1 overflow-y-auto">
+              {basketLines.map((l) => (
+                <li key={l.item} className="flex items-center gap-2 text-sm">
+                  <span className="min-w-0 flex-1 truncate text-zinc-800">
+                    {l.name}
+                    {l.price === 0 && (
+                      <span className="ms-2 text-xs text-amber-700">{translate("No price set")}</span>
+                    )}
+                  </span>
+                  <button type="button" aria-label={translate("Less")} disabled={busy || stepping}
+                    onClick={() => setQty(l.item, l.qty - 1)}
+                    className="flex size-7 items-center justify-center rounded-full border border-zinc-200 text-zinc-600 hover:bg-zinc-50 disabled:opacity-40">
+                    <Minus className="size-3.5" />
+                  </button>
+                  <span className="w-5 text-center tabular-nums">{l.qty}</span>
+                  <button type="button" aria-label={translate("One more")} disabled={busy || stepping}
+                    onClick={() => setQty(l.item, l.qty + 1)}
+                    className="flex size-7 items-center justify-center rounded-full border border-zinc-200 text-zinc-600 hover:bg-zinc-50 disabled:opacity-40">
+                    <Plus className="size-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button type="button" disabled={busy || stepping || basketLines.length === 0}
+                onClick={() => answer(BASKET_DONE, translate("Done"))}
+                className="rounded-full bg-brand-600 px-3 py-1 text-xs font-medium text-white disabled:opacity-40">
+                {translate("Done")}
+              </button>
+              <button type="button" disabled={busy || stepping || basketLines.length === 0}
+                onClick={sendBasket}
+                className="rounded-full border border-brand-200 bg-brand-50 px-3 py-1 text-xs font-medium text-brand-800 disabled:opacity-40">
+                {translate("Send to the kitchen")}
+              </button>
+              <button type="button" disabled={busy || stepping || basketLines.length === 0}
+                onClick={() => answer(BASKET_CLEAR, translate("Clear the order"))}
+                className="rounded-full px-3 py-1 text-xs font-medium text-zinc-500 disabled:opacity-40">
+                {translate("Clear the order")}
+              </button>
+            </div>
+          </div>
+        )}
+        <form
+          className="p-3"
+          onSubmit={(e) => {
+            e.preventDefault()
+            // Send is the only way spoken words go out; it ends the listening
+            voiceRef.current?.stop()
+            submit(input)
+          }}
+        >
+          <div className="flex items-center gap-2 rounded-2xl border border-zinc-200 bg-white px-4 py-1.5 shadow-sm transition focus-within:border-brand-400 focus-within:ring-2 focus-within:ring-brand-100">
+            <input
+              ref={inputRef}
+              className="flex-1 bg-transparent py-2 text-sm outline-none text-zinc-900 placeholder:text-zinc-400 disabled:cursor-not-allowed"
+              placeholder={
+                chatLocked
+                  ? translate("Tap a task. Typing a question needs an AI key.")
+                  : (stepNow?.text || translate("Ask anything about the hotel…"))
+              }
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              disabled={busy}
+            />
+            <VoiceButton
+              ref={voiceRef}
+              disabled={busy || stepping}
+              onText={setInput}
+              onError={setError}
+            />
+            <button
+              type="submit"
+              aria-label={translate("Send")}
+              disabled={busy || stepping || !input.trim()}
+              className="flex size-9 items-center justify-center rounded-full bg-brand-600 text-white transition hover:bg-brand-700 disabled:opacity-40"
+            >
+              {busy ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Send className="size-4" />
+              )}
+            </button>
+          </div>
+          {!voiceSupported && (
+            <p className="px-1 pt-1.5 text-xs text-zinc-500">
+              {translate("This browser can't use the microphone. Type instead, or open DezPMS in Chrome or Safari.")}
+            </p>
+          )}
+        </form>
+      </div>
+    </div>
+  )
+}

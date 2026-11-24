@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# least privilege: these jobs only read the repo
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend typecheck & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run i18n:check
+        working-directory: frontend
+      - run: npm run languages:check
+        working-directory: frontend
+      - name: UI language fallback rules
+        run: python3 -m unittest DezPMS.tests.test_ui_language_logic
+      - run: npm run build
+        working-directory: frontend
+      - name: Verify production serve base
+        # The served SPA must reference its assets under /assets/DezPMS/frontend/;
+        # a wrong base here silently breaks the /DezPMS install.
+        run: grep -q "/assets/DezPMS/frontend/assets/" DezPMS/public/frontend/index.html
+
+      - name: Check international phone handling
+        run: npm run phone:check
+        working-directory: frontend
+
+      - name: Check CSV export quoting and the formula guard
+        run: npm run csv:check
+        working-directory: frontend
+
+      - name: Check booking default room-type picker
+        run: npm run booking-defaults:check
+        working-directory: frontend
+
+      - name: Check lock messages after undoing a check-in
+        run: npm run key-notice:check
+        working-directory: frontend
+
+      - name: Check nightly prices typed on New booking
+        run: npm run night-prices:check
+        working-directory: frontend
+
+      - name: Check the offline cache and queue
+        run: npm run offline:check
+        working-directory: frontend
+
+      - name: Check the food-order basket survives a typed done
+        run: npm run agent-order:check
+        working-directory: frontend
+
+  contract:
+    # Fails a PR that breaks what connected apps rely on (MCP tools, REST
+    # methods, scopes, webhooks). No bench: the contract is read from source.
+    name: Public contract check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Unit tests for the checker
+        run: python3 -m unittest scripts/test_contract_check.py
+      - name: Compare with the base branch
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --depth=1 origin "$BASE_SHA"
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          python3 docs-site/gen_contract.py --root "$RUNNER_TEMP/base" --out "$RUNNER_TEMP/base.json"
+          python3 docs-site/gen_contract.py --keep "$RUNNER_TEMP/base.json" --out "$RUNNER_TEMP/head.json"
+          set -o pipefail
+          python3 scripts/contract_check.py "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/head.json" \
+            --deprecations contract-deprecations.json | tee contract.out
+      - name: Summary
+        if: always()
+        run: |
+          [ -f contract.out ] || exit 0
+          { echo '### Public contract'; echo '```'; cat contract.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  evals:
+    name: Backend eval harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: apps/DezPMS
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y redis-server mariadb-client
+          sudo service redis-server start
+          npm install -g yarn
+
+      - name: Configure MariaDB
+        run: |
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            SET GLOBAL character_set_server = 'utf8mb4';
+            SET GLOBAL collation_server = 'utf8mb4_unicode_ci';"
+
+      - name: Init bench
+        run: |
+          pip install frappe-bench
+          # pinned to the stable release tag: the version-16 branch tip
+          # currently ships an UnboundLocalError in frappe/locale.py
+          bench init --skip-redis-config-generation --skip-assets \
+            --frappe-branch v16.25.0 frappe-bench
+          cd frappe-bench
+          bench set-config -g db_host 127.0.0.1
+          bench set-config -g redis_cache redis://127.0.0.1:6379
+          bench set-config -g redis_queue redis://127.0.0.1:6379
+          bench set-config -g redis_socketio redis://127.0.0.1:6379
+
+      - name: Install app & site
+        run: |
+          cd frappe-bench
+          bench get-app payments
+          bench get-app DezPMS "${GITHUB_WORKSPACE}/apps/DezPMS"
+          bench new-site test.localhost \
+            --mariadb-user-host-login-scope='%' \
+            --db-root-password root --admin-password admin
+          bench --site test.localhost install-app DezPMS
+          bench --site test.localhost set-config developer_mode 1
+
+      - name: Run eval harness
+        run: |
+          cd frappe-bench
+          printf 'from DezPMS.scripts.eval_harness import execute\nexecute()\nexit\n' \
+            | bench --site test.localhost console | tee eval.out
+          awk '/eval harness: [0-9]+\/[0-9]+ passed/ { split($5, n, "/"); ok = (n[1] == n[2]) } END { exit !ok }' eval.out  # all green, however many checks
+
+      - name: Run the banquet unit tests
+        run: |
+          cd frappe-bench
+          bench --site test.localhost set-config allow_tests true
+          bench --site test.localhost run-tests --module DezPMS.tests.test_banquet \
+            2>&1 | tee banquet.out
+          grep -qE "^OK$" banquet.out
+
+      - name: Run the night audit, ledger and scheduled-audit unit tests
+        run: |
+          cd frappe-bench
+          for m in test_assistant_currency test_nicaragua_pack test_night_audit test_ledger_audit test_folio_leaks test_bill_settlement test_health test_scheduled_jobs test_golive test_credit_control test_webhooks test_pos_interface test_mcp test_contract_keys test_seed_history test_rates test_rates_include_levy test_night_prices test_night_prices_booking test_holiday_package test_siu_room_type_sync test_booking_options_order test_payment_idempotency test_ui_languages test_telemetry test_ar_write_off test_ar_withholding test_erpnext_bridge test_hk_cases_and_links test_offline_conflict test_pos_zero_price test_unit_owners test_recreation test_owner_accounts; do
+            bench --site test.localhost run-tests --module DezPMS.tests.$m \
+              2>&1 | tee "$m.out"
+            # known bugs are pinned as expected failures and a few tests skip
+            # by design, so OK may carry those counts
+            grep -qE "^OK( \(((expected failures|skipped)=[0-9]+(, )?)+\))?$" "$m.out" || exit 1
+          done
+
+      - name: Run front-desk persona journey
+        run: |
+          cd frappe-bench
+          printf 'from DezPMS.scripts.frontdesk_eval import execute\nexecute()\nexit\n' \
+            | bench --site test.localhost console | tee journey.out
+          grep -q "13/13 passed" journey.out
+
+      - name: Fresh-install correctness (roles bind, SPA serves)
+        run: |
+          cd frappe-bench
+          cat > /tmp/fresh_check.py <<'PY'
+          import os, frappe
+          roles = ["Front Desk","Housekeeping","Finance","Revenue Manager","DezPMS Agent","Hotel Admin"]
+          missing = [r for r in roles if not frappe.db.exists("Role", r)]
+          assert not missing, f"roles auto-create failed: {missing}"
+          assert frappe.get_all("DocPerm", filters={"parent":"Reservation"}), "no Reservation perms bound"
+          assert os.path.exists(frappe.get_app_path("DezPMS","public","frontend","index.html")), "built SPA not shipped"
+          assert os.path.exists(frappe.get_app_path("DezPMS","www","DezPMS.py")), "SPA boot page missing"
+          rules = str(frappe.get_hooks("website_route_rules"))
+          assert "/DezPMS/<path:app_path>" in rules, "/DezPMS route rule missing"
+          print("FRESH-INSTALL CHECKS PASSED")
+          PY
+          printf 'exec(open("/tmp/fresh_check.py").read())\nexit\n' \
+            | bench --site test.localhost console | tee fresh.out
+          grep -q "FRESH-INSTALL CHECKS PASSED" fresh.out

@@ -1,0 +1,39 @@
+{
+  "description": "Example Packer template for a DigitalOcean Marketplace DezPMS 1-Click image. Fill do_token; run packer build after vendor approval.",
+  "variables": {
+    "do_token": "{{env `DIGITALOCEAN_TOKEN`}}",
+    "image_name": "DezPMS-marketplace-{{timestamp}}"
+  },
+  "builders": [
+    {
+      "type": "digitalocean",
+      "api_token": "{{user `do_token`}}",
+      "image": "ubuntu-24-04-x64",
+      "region": "blr1",
+      "size": "s-4vcpu-8gb",
+      "ssh_username": "root",
+      "snapshot_name": "{{user `image_name`}}"
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "shell",
+      "inline": [
+        "curl -fsSL https://get.docker.com | sh",
+        "systemctl enable docker",
+        "mkdir -p /opt/DezPMS",
+        "curl -fsSL https://raw.githubusercontent.com/DezPMS-PMS/DezPMS-pms/main/deploy/install.sh -o /opt/DezPMS/install.sh",
+        "chmod +x /opt/DezPMS/install.sh",
+        "/opt/DezPMS/install.sh build",
+        "swapoff /swapfile-DezPMS 2>/dev/null || true; rm -f /swapfile-DezPMS; sed -i '/swapfile-DezPMS/d' /etc/fstab",
+        "docker builder prune -af",
+        "echo 'DezPMS 1-Click image ready (DezPMS:local baked) — first boot runs install.sh with Marketplace UDFs.'"
+      ]
+    },
+    {
+      "type": "file",
+      "source": "cloud-init.yaml.example",
+      "destination": "/etc/DezPMS/cloud-init.yaml.example"
+    }
+  ]
+}

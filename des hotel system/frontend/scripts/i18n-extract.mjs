@@ -1,0 +1,134 @@
+#!/usr/bin/env node
+/**
+ * Extract English UI strings from t() and its translate()/translateUI() aliases into catalog.csv.
+ * Merges every locale under src/i18n/locales, so a translation survives a rebuild and
+ * a newly added language only needs its own locales/<code>.json.
+ *
+ * Usage: node scripts/i18n-extract.mjs
+ */
+import fs from "node:fs"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const root = path.join(__dirname, "..")
+const src = path.join(root, "src")
+const outCsv = path.join(root, "src/i18n/catalog.csv")
+const localesDir = path.join(root, "src/i18n/locales")
+
+/** Shipped languages, in catalog column order: [locale code, column name]. */
+const COLUMNS = [
+  ["ar", "arabic"],
+  ["es", "spanish"],
+  ["pt", "portuguese"],
+  ["zh-CN", "chinese"],
+]
+
+function walk(dir, files = []) {
+  for (const name of fs.readdirSync(dir)) {
+    const p = path.join(dir, name)
+    const st = fs.statSync(p)
+    if (st.isDirectory()) walk(p, files)
+    else if (/\.(tsx|ts)$/.test(name) && !name.endsWith(".d.ts")) files.push(p)
+  }
+  return files
+}
+
+function csvEscape(s) {
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+  return s
+}
+
+function placeholders(s) {
+  return [...new Set([...s.matchAll(/\{(\w+)\}/g)].map((x) => x[1]))].join(" ")
+}
+
+/** code -> { English source: translation }; missing file means nothing yet. */
+const existing = {}
+for (const [code] of COLUMNS) {
+  const file = path.join(localesDir, `${code}.json`)
+  existing[code] = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {}
+}
+
+const keys = new Map()
+const tCall =
+  /\b(?:t|translate|translateUI)\(\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/g
+
+// tn(count, "{n} child", "{n} children"): both forms are keys
+const tnCall =
+  /\btn\([^,()]*(?:\([^()]*\))?[^,()]*,\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1\s*,\s*(["'`])((?:\\.|(?!\3)[^\\])*)\3/g
+
+function add(key, source) {
+  if (!key || !/[A-Za-z]/.test(key)) return
+  if (key.includes("${")) return
+  if (!keys.has(key)) keys.set(key, new Set())
+  // POSIX separators: the catalog is committed, so a Windows build must not
+  // rewrite every row's sources with backslashes.
+  keys.get(key).add(path.relative(src, source).split(path.sep).join("/"))
+}
+
+for (const file of walk(src)) {
+  const text = fs.readFileSync(file, "utf8")
+  tCall.lastIndex = 0
+  let m
+  while ((m = tCall.exec(text))) {
+    add(
+      m[2].replace(/\\n/g, "\n").replace(/\\'/g, "'").replace(/\\"/g, '"'),
+      file,
+    )
+  }
+  tnCall.lastIndex = 0
+  while ((m = tnCall.exec(text))) {
+    for (const k of [m[2], m[4]])
+      add(k.replace(/\\'/g, "'").replace(/\\"/g, '"'), file)
+  }
+}
+
+// Finish setup receives its labels and help text from this server endpoint.
+// Include those literals so new checklist copy appears in the catalog too.
+const checklistFile = path.join(root, "../DezPMS/onboarding.py")
+const serverCall = /\b_\(\s*(["'])((?:\\.|(?!\1)[^\\])*)\1\s*\)/g
+for (const match of fs.readFileSync(checklistFile, "utf8").matchAll(serverCall)) {
+  add(
+    match[2].replace(/\\n/g, "\n").replace(/\\'/g, "'").replace(/\\"/g, '"'),
+    checklistFile,
+  )
+}
+
+// These server defaults are displayed as menu categories, courses, stations and tags.
+const settingsFile = path.join(root, "../DezPMS/settings.py")
+const menuDefaults = /\bS\("menu_(?:categories|courses|prep_stations|allergen_tags)",\s*"[^"\n]*",\s*"textarea",\s*"((?:\\.|[^"\\])*)"/g
+for (const match of fs.readFileSync(settingsFile, "utf8").matchAll(menuDefaults)) {
+  for (const option of match[1].replace(/\\n/g, "\n").split("\n")) {
+    add(option.trim(), settingsFile)
+  }
+}
+
+// Menu labels, statuses and saved reports can call t(variable). Keep their
+// dictionary keys when rebuilding the catalog so a later import retains them.
+for (const dict of Object.values(existing)) {
+  for (const key of Object.keys(dict)) {
+    if (!keys.has(key)) keys.set(key, new Set())
+  }
+}
+
+const rows = [...keys.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+const lines = [
+  ["key", "english", ...COLUMNS.map(([, column]) => column), "sources", "placeholders", "status"].join(","),
+]
+for (const [key, sources] of rows) {
+  const cells = COLUMNS.map(([code]) => existing[code][key] ?? "")
+  lines.push(
+    [
+      csvEscape(key),
+      csvEscape(key),
+      ...cells.map(csvEscape),
+      csvEscape([...sources].sort().join("; ")),
+      csvEscape(placeholders(key)),
+      cells.every(Boolean) ? "translated" : "needs_translation",
+    ].join(","),
+  )
+}
+
+fs.writeFileSync(outCsv, "\uFEFF" + lines.join("\n") + "\n", "utf8")
+console.log(`Wrote ${rows.length} keys → ${path.relative(root, outCsv)}`)

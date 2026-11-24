@@ -1,0 +1,14 @@
+{
+  "name": "DezPMS PMS",
+  "short_name": "DezPMS",
+  "description": "DezPMS hotel PMS - front desk, housekeeping and billing.",
+  "start_url": "/DezPMS",
+  "scope": "/DezPMS",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    { "src": "/assets/DezPMS/frontend/DezPMS-mark.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/assets/DezPMS/frontend/apple-touch-180.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

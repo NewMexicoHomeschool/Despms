@@ -1,0 +1,532 @@
+app_name = "DezPMS"
+app_title = "DezPMS"
+app_publisher = "HeyKoala"
+app_description = (
+	"Open-source, AI-native hotel PMS — front desk, direct booking, "
+	"housekeeping, folios and GST billing, with an MCP tool layer so AI "
+	"agents can run the property."
+)
+app_email = "hello@DezPMSpms.com"
+app_license = "apache-2.0"
+
+# Branding shown in the Desk navbar, app switcher and marketplace listing.
+app_logo_url = "/assets/DezPMS/DezPMS-mark.svg"
+app_icon = "octicon octicon-home"
+app_color = "#1E7B4F"
+
+# The product UI is the React SPA at /DezPMS; surface it in the Apps launcher
+# (and the /apps grid) so users land on it instead of the Desk.
+add_to_apps_screen = [
+	{
+		"name": "DezPMS",
+		"logo": "/assets/DezPMS/DezPMS-mark.svg",
+		"title": "DezPMS",
+		"route": "/DezPMS",
+	}
+]
+
+# Automated end-of-day: post room charges, flag no-shows, per property.
+scheduler_events = {
+	"cron": {
+		"0 * * * *": [
+			"DezPMS.channel_manager.push_all_ari",
+			# custom reports with Daily/Weekly email schedule
+			"DezPMS.custom_reports.run_scheduled_custom_reports",
+			# online exchange rates for the business date (off unless a
+			# property turns on fx_auto_fetch; only fills missing rates)
+			"DezPMS.ledger.auto_fetch_exchange_rates",
+		],
+		# 09:00 - send self check-in links to upcoming arrivals, for properties
+		# that turned the setting on (a plain automation, not an agent)
+		# (and company payment reminders, off unless a property turns them on)
+		"0 9 * * *": ["DezPMS.prearrival.run_prearrival_outreach",
+		              "DezPMS.statements.run_payment_reminders"],
+		# every 15 min - escalate overdue housekeeping tasks up the ladder;
+		# also release expired Held / Pending Payment reservations (ADR-006)
+		# and, past the property's release time, today's non-guaranteed
+		# arrivals (no-show policy, off unless a release time is set)
+		# also close the day: the night audit runs per property at its own
+		# night_audit_time on its own clock (default 03:00), one date a tick
+		"*/15 * * * *": [
+			"DezPMS.folio.nightly_audit_all_properties",
+			"DezPMS.housekeeping.escalate_overdue_tasks",
+			"DezPMS.reservation_state.expire_holds",
+			# group blocks past their cutoff give unpicked rooms back to sale
+			"DezPMS.group_blocks.release_expired_blocks",
+			"DezPMS.no_show.release_non_guaranteed_arrivals",
+			# day-use past planned ETD → front-desk bell once per stay
+			"DezPMS.day_use.alert_overdue_day_use",
+		],
+		# 08:30 - the banquet team's morning list: follow-ups gone quiet,
+		# tentative holds about to lapse, payments due, event orders missing
+		"30 8 * * *": ["DezPMS.banquet.run_banquet_reminders"],
+		# 04:15 - wipe the public demo so it cannot be used as a live PMS
+		# (no-op unless DezPMS_demo_mode is on and the site is a playground)
+		"15 4 * * *": ["DezPMS.scripts.reset_demo.scheduled"],
+		# 03:30 - storage limitation (DPDP s.8(7)): erase guests idle past
+		# their property's retention period
+		"30 3 * * *": ["DezPMS.privacy.apply_retention",
+		               # recreation memberships past their last day (#632)
+		               "DezPMS.recreation.expire_memberships"],
+		# 03:40 - the same for conversations: WhatsApp message text and AI
+		# assistant chats past the property's message retention period
+		"40 3 * * *": ["DezPMS.privacy.apply_message_retention"],
+		# 03:50 - finished kitchen print jobs (guest names on the ticket)
+		# are kept a week for reprints, then dropped
+		"50 3 * * *": ["DezPMS.printing.purge_old_jobs"],
+		# 03:55 - bell notifications are kept 30 days, then dropped
+		"55 3 * * *": ["DezPMS.notifications.purge_old"],
+		# 04:45 - drop old DezPMSpms.com Hosting Enquiry leads (default 24 months;
+		# Won / converted stays; site_config hosting_enquiry_retention_months)
+		"45 4 * * *": ["DezPMS.hosting_enquiry_retention.purge_expired_hosting_enquiries"],
+		# 06:00 and 18:00 - warm the GitHub latest-release cache for the update nag
+		"0 6,18 * * *": ["DezPMS.health.poll_github_releases"],
+		# 05:35 - the anonymous install heartbeat (#657); off in Settings,
+		# or with DezPMS_TELEMETRY=0 / DO_NOT_TRACK=1 / DezPMS_telemetry: 0
+		# ponytail: one fixed minute for every install; add jitter if the endpoint sees bursts
+		"35 5 * * *": ["DezPMS.telemetry.send_heartbeat"],
+		# every minute - outbound webhook retries that are due (backoff), and
+		# the ARI outbox: what waited for its batch window, pause or retry
+		"* * * * *": ["DezPMS.webhooks.retry_due", "DezPMS.channel_ari.enqueue_ari_flushes"],
+		# 06:20 - the ARI outbox's nightly sweep: only differences (the day
+		# entering the 500-day horizon, what a trigger missed); never a full
+		# sync on a timer
+		"20 6 * * *": ["DezPMS.channel_ari.nightly_sweep"],
+	},
+}
+
+# DPDP Rules: keep logs of access to personal data for at least one year
+# (Frappe's own defaults are 30 and 90 days).
+default_log_clearing_doctypes = {
+	"Access Log": [365],
+	"Activity Log": [365],
+}
+
+# Apps
+# ------------------
+
+required_apps = ["payments"]
+
+# Localization packs by country (regional_overrides style). A future
+# DezPMS_uae APP declares its own to claim "United Arab Emirates".
+DezPMS_localization = {
+	"India": "DezPMS.localization.india",
+	"Indonesia": "DezPMS.localization.indonesia",
+	"Thailand": "DezPMS.localization.thailand",
+	"Malaysia": "DezPMS.localization.malaysia",
+	"United Arab Emirates": "DezPMS.localization.uae",
+	"Saudi Arabia": "DezPMS.localization.saudi",
+	"Brazil": "DezPMS.localization.brazil",
+	"Brasil": "DezPMS.localization.brazil",
+	"Nicaragua": "DezPMS.localization.nicaragua",
+	"Germany": "DezPMS.localization.germany",
+	"Philippines": "DezPMS.localization.philippines",
+}
+
+# Served single-page app
+# -----------------------
+# The React front-end mounts at /DezPMS and owns all client-side routes
+# (front desk, booking engine, housekeeping, self check-in). The `DezPMS` www
+# page (DezPMS/www/DezPMS.py) serves the built shell with the CSRF token
+# injected; every deep link falls through to it so browser refresh works.
+website_route_rules = [
+	{"from_route": "/DezPMS/<path:app_path>", "to_route": "DezPMS"},
+]
+
+# Clean, shareable guest URLs redirect into the SPA's routes.
+website_redirects = [
+	{"source": r"/book$", "target": "/DezPMS/book"},
+	{"source": r"/book/(.*)", "target": r"/DezPMS/book/\1"},
+	{"source": r"/stay$", "target": "/DezPMS/stay"},
+	{"source": r"/stay/(.*)", "target": r"/DezPMS/stay/\1"},
+	{"source": r"/hk$", "target": "/DezPMS/hk"},
+	{"source": r"/checkin/(.*)", "target": r"/DezPMS/checkin/\1"},
+	# Frappe password-reset emails land on /update-password?key=… — keep the key
+	# and show DezPMS's own set-password screen instead of Desk's HTML form.
+	{
+		"source": r"/update-password$",
+		"target": "/DezPMS/update-password",
+		"forward_query_parameters": True,
+	},
+]
+
+# Each item in the list will be shown as an app in the apps page
+# add_to_apps_screen = [
+# 	{
+# 		"name": "DezPMS",
+# 		"logo": "/assets/DezPMS/logo.png",
+# 		"title": "DezPMS",
+# 		"route": "/DezPMS",
+# 		"has_permission": "DezPMS.api.permission.has_app_permission"
+# 	}
+# ]
+
+# Includes in <head>
+# ------------------
+
+# include js, css files in header of desk.html
+# app_include_css = "/assets/DezPMS/css/DezPMS.css"
+# app_include_js = "/assets/DezPMS/js/DezPMS.js"
+
+# include js, css files in header of web template
+# web_include_css = "/assets/DezPMS/css/DezPMS.css"
+# web_include_js = "/assets/DezPMS/js/DezPMS.js"
+
+# include custom scss in every website theme (without file extension ".scss")
+# website_theme_scss = "DezPMS/public/scss/website"
+
+# include js, css files in header of web form
+# webform_include_js = {"doctype": "public/js/doctype.js"}
+# webform_include_css = {"doctype": "public/css/doctype.css"}
+
+# include js in page
+# page_js = {"page" : "public/js/file.js"}
+
+# include js in doctype views
+# doctype_js = {"doctype" : "public/js/doctype.js"}
+# doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
+# doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
+# doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
+
+# Svg Icons
+# ------------------
+# include app icons in desk
+# app_include_icons = "DezPMS/public/icons.svg"
+
+# Home Pages
+# ----------
+
+# application home page (will override Website Settings)
+# home_page = "login"
+
+# website user home page (by Role)
+# role_home_page = {
+# 	"Role": "home_page"
+# }
+
+# Generators
+# ----------
+
+# automatically create page for each record of this doctype
+# website_generators = ["Web Page"]
+
+# automatically load and sync documents of this doctype from downstream apps
+# importable_doctypes = [doctype_1]
+
+# Jinja
+# ----------
+
+# add methods and filters to jinja environment
+# jinja = {
+# 	"methods": "DezPMS.utils.jinja_methods",
+# 	"filters": "DezPMS.utils.jinja_filters"
+# }
+
+# Installation
+# ------------
+
+# before_install = "DezPMS.install.before_install"
+after_install = "DezPMS.install.after_install"
+after_migrate = ["DezPMS.install.after_migrate"]
+
+# Uninstallation
+# ------------
+
+# before_uninstall = "DezPMS.uninstall.before_uninstall"
+# after_uninstall = "DezPMS.uninstall.after_uninstall"
+
+# Integration Setup
+# ------------------
+# To set up dependencies/integrations with other apps
+# Name of the app being installed is passed as an argument
+
+# before_app_install = "DezPMS.utils.before_app_install"
+# after_app_install = "DezPMS.utils.after_app_install"
+
+# Integration Cleanup
+# -------------------
+# To clean up dependencies/integrations with other apps
+# Name of the app being uninstalled is passed as an argument
+
+# before_app_uninstall = "DezPMS.utils.before_app_uninstall"
+# after_app_uninstall = "DezPMS.utils.after_app_uninstall"
+
+# Build
+# ------------------
+# To hook into the build process
+
+# after_build = "DezPMS.build.after_build"
+
+# Desk Notifications
+# ------------------
+# See frappe.core.notifications.get_notification_config
+
+# notification_config = "DezPMS.notifications.get_notification_config"
+
+# Permissions
+# -----------
+# Permissions evaluated in scripted ways
+
+# Guest has no property link, so Property User Permissions can't limit it;
+# these apply DezPMS's stay-history rule to Frappe's own REST, Desk and
+# private file downloads too (see DezPMS.authz.guest_query_conditions).
+# Every DezPMS DocType linking a Property fails closed under the opt-in
+# DezPMS_strict_property_scope site setting; with it off these add nothing.
+_PROPERTY_SCOPED = (
+	"Agent Action Log", "AI Assistant Settings", "Allowance Request", "Banquet Checklist Template",
+	"Banquet Dish", "Banquet Function Task", "Banquet Menu",
+	"Banquet Service Item", "Cancelled Invoice", "Cash Transfer", "Cashier", "Cashier Session", "Cashier Terminal",
+	"Cashier Transaction", "Channel ARI Outbox", "Channel Manager Connection",
+	"Channel Provider Connection", "City Ledger Account", "City Ledger Entry",
+	"Copilot Conversation", "Credit Note", "Discount Voucher", "ERPNext Sync Log", "Exchange Rate",
+	"Exchange Transaction", "Experience", "External POS Charge", "Floor", "Folio", "Folio Ledger Entry",
+	"Folio Reprint", "Group Booking", "Holiday Package", "Housekeeping Task", "Hurdle Rate",
+	"Ingredient", "Ingredient Ledger Entry", "Ingredient Stock", "DezPMS Custom Report", "DezPMS Notification", "Kitchen Printer",
+	"Laundry Order", "Laundry Rate", "Lost And Found Item", "MCP OAuth Grant",
+	"Meal Plan", "Menu Item", "Night Audit Log", "Night Audit Run", "Outbound Webhook",
+	"Outbound Webhook Delivery", "Payment Gateway Settings",
+	"Petty Cash Voucher", "POS Order", "POS Outlet", "POS Table Reservation",
+	"Print Job",
+	"Proforma Folio", "Property Setting", "Rate Guardrail", "Rate Plan", "Rate Restriction",
+	"Recreation Booking", "Recreation Customer", "Recreation Facility",
+	"Recreation Membership", "Recreation Plan", "Recreation Therapist",
+	"Recreation Treatment", "Recreation Visit",
+	"Reservation",
+	"Long Stay Discount", "Revenue Budget", "Room", "Room Block", "Room Discrepancy", "Room Type", "Season",
+	"Security Deposit", "Sellable Unit", "Service Ticket", "Shift Handover", "SOP Template", "Ticket Event",
+	"Tax Withheld", "Transaction Code", "Turnover Profile", "Vendor", "Vendor Bill", "Venue", "Venue Booking",
+	"WhatsApp Message", "ZATCA Invoice", "ZATCA Settings",
+)
+
+# These hang from a channel connection and have no property field: they are
+# scoped through their connection's property, with the strict scope off too
+# (DezPMS.authz.connection_query_conditions).
+_CONNECTION_SCOPED = ("Channel ARI State", "Channel Room Mapping")
+
+permission_query_conditions = {
+	"Guest": "DezPMS.authz.guest_query_conditions",
+	"Itinerary": "DezPMS.authz.itinerary_query_conditions",
+	**{dt: "DezPMS.authz.property_query_conditions" for dt in _PROPERTY_SCOPED},
+	**{dt: "DezPMS.authz.connection_query_conditions" for dt in _CONNECTION_SCOPED},
+}
+
+has_permission = {
+	"Guest": "DezPMS.authz.guest_has_permission",
+	"Itinerary": "DezPMS.authz.itinerary_has_permission",
+	**{dt: "DezPMS.authz.property_has_permission" for dt in _PROPERTY_SCOPED},
+	**{dt: "DezPMS.authz.connection_has_permission" for dt in _CONNECTION_SCOPED},
+}
+
+# Document Events
+# ---------------
+# Hook on document methods and events
+
+doc_events = {
+	doctype: {
+		"on_update": "DezPMS.realtime.notify",
+		"after_insert": "DezPMS.realtime.notify",
+		"on_trash": "DezPMS.realtime.notify",
+	}
+	for doctype in ("Reservation", "Folio", "Room", "Housekeeping Task",
+	                "Venue Booking", "Group Booking", "POS Order",
+	                "Service Ticket", "Laundry Order", "Agent Action Log")
+}
+
+# The notification bell (DezPMS.notifications): a short line for the module
+# that should know, written next to the realtime ping. The bell itself
+# re-fetches when a new DezPMS Notification is pinged.
+for _dt, _events in {
+	"Folio": {"on_update": "on_folio_update"},
+	"Housekeeping Task": {"after_insert": "on_housekeeping_task_insert",
+	                      "on_update": "on_housekeeping_task_update"},
+	"Ingredient Ledger Entry": {"after_insert": "on_ingredient_ledger_insert"},
+	"Laundry Order": {"after_insert": "on_laundry_order_insert"},
+	"POS Order": {"after_insert": "on_pos_order_insert",
+	              "on_update": "on_pos_order_update"},
+	"Rate Plan": {"on_update": "on_rate_plan_update"},
+	"Room Type": {"on_update": "on_room_type_update"},
+	"Season": {"after_insert": "on_season_change", "on_update": "on_season_change"},
+	"Service Ticket": {"after_insert": "on_service_ticket_insert",
+	                   "on_update": "on_service_ticket_update"},
+	"Venue Booking": {"after_insert": "on_venue_booking_insert",
+	                  "on_update": "on_venue_booking_update"},
+}.items():
+	for _event, _fn in _events.items():
+		_have = doc_events.setdefault(_dt, {}).get(_event)
+		doc_events[_dt][_event] = ([_have] if _have else []) + [f"DezPMS.notifications.{_fn}"]
+doc_events["DezPMS Notification"] = {"after_insert": "DezPMS.realtime.notify"}
+
+# A reservation booked/modified/cancelled moves availability, so fan the new
+# numbers out to the channel manager (Pipeline 1). Runs alongside the realtime
+# notify; best-effort and after-commit so it never affects the booking itself.
+# The same changes are offered to integrators as outbound webhooks
+# (reservation.*, guest.checked_in/out): queued in the transaction, sent
+# after commit (DezPMS.webhooks).
+doc_events["Reservation"] = {
+	"after_insert": ["DezPMS.realtime.notify",
+	                 "DezPMS.channel_manager.on_reservation_change",
+	                 "DezPMS.webhooks.on_reservation_insert",
+	                 "DezPMS.notifications.on_reservation_insert"],
+	"on_update": ["DezPMS.realtime.notify",
+	              "DezPMS.channel_manager.on_reservation_change",
+	              "DezPMS.webhooks.on_reservation_update",
+	              "DezPMS.notifications.on_reservation_update"],
+	"on_trash": "DezPMS.realtime.notify",
+}
+
+# What moves availability or price queues an ARI change for the connections
+# with an outbox (DezPMS.channel_ari: only changes, in ranges, under the
+# provider's rate limit). Reservations go through on_reservation_change.
+for _doctype in ("Season", "Rate Restriction", "Rate Plan", "Room Type", "Hurdle Rate", "Rate Guardrail",
+                 "Room", "Room Block", "Channel Room Mapping"):
+	_events = doc_events.setdefault(_doctype, {})
+	for _event in ("on_update", "after_insert", "on_trash"):
+		_current = _events.get(_event) or []
+		_events[_event] = ([_current] if isinstance(_current, str) else list(_current)) + [
+			"DezPMS.channel_ari.on_ari_source_change"]
+del _doctype, _events, _event, _current
+
+# a unit added to (or moved between) unit types an owner holds joins
+# that owner's scope at once (#639)
+_room = doc_events.setdefault("Room", {})
+for _event in ("after_insert", "on_update"):
+	_current = _room.get(_event) or []
+	_room[_event] = ([_current] if isinstance(_current, str) else list(_current)) + [
+		"DezPMS.owners.on_room_change"]
+del _room, _event, _current
+
+# Scheduled Tasks
+# ---------------
+
+# scheduler_events = {
+# 	"all": [
+# 		"DezPMS.tasks.all"
+# 	],
+# 	"daily": [
+# 		"DezPMS.tasks.daily"
+# 	],
+# 	"hourly": [
+# 		"DezPMS.tasks.hourly"
+# 	],
+# 	"weekly": [
+# 		"DezPMS.tasks.weekly"
+# 	],
+# 	"monthly": [
+# 		"DezPMS.tasks.monthly"
+# 	],
+# }
+
+# Testing
+# -------
+
+# before_tests = "DezPMS.install.before_tests"
+
+# Extend DocType Class
+# ------------------------------
+#
+# Specify custom mixins to extend the standard doctype controller.
+# extend_doctype_class = {
+# 	"Task": "DezPMS.custom.task.CustomTaskMixin"
+# }
+
+# Overriding Methods
+# ------------------------------
+#
+# Frappe's setup wizard writes settings and a System Manager user; on a DezPMS
+# site only a System Manager may call it (see DezPMS.setup_guard).
+override_whitelisted_methods = {
+	"frappe.desk.page.setup_wizard.setup_wizard.setup_complete":
+		"DezPMS.setup_guard.setup_complete",
+	"frappe.desk.page.setup_wizard.setup_wizard.initialize_system_settings_and_user":
+		"DezPMS.setup_guard.initialize_system_settings_and_user",
+}
+#
+# each overriding function accepts a `data` argument;
+# generated from the base implementation of the doctype dashboard,
+# along with any modifications made in other Frappe apps
+# override_doctype_dashboards = {
+# 	"Task": "DezPMS.task.get_dashboard_data"
+# }
+
+# exempt linked doctypes from being automatically cancelled
+#
+# auto_cancel_exempted_doctypes = ["Auto Repeat"]
+
+# Ignore links to specified DocTypes when deleting documents
+# -----------------------------------------------------------
+
+# ignore_links_on_delete = ["Communication", "ToDo"]
+
+# Door lock connectors (DezPMS.door_lock). A vendor app adds its own:
+# DezPMS_door_lock_adapters = {"acme": "acme_DezPMS.locks.AcmeAdapter"}
+DezPMS_door_lock_adapters = {"manual": "DezPMS.door_lock.ManualAdapter"}
+
+# Remote MCP + OAuth live at /mcp and /mcp/oauth/* (not the SPA).
+page_renderer = ["DezPMS.mcp_http.MCPPageRenderer"]
+
+# Request Events
+# ----------------
+# Preserve AioSell's Basic-auth header for the channel webhook before Frappe's
+# own api-key auth rejects it (see DezPMS.channels.aiosell.preserve_webhook_auth).
+before_request = [
+	"DezPMS.channels.aiosell.preserve_webhook_auth",
+	# the public demo shows the maintenance page while it rebuilds
+	"DezPMS.demo_guard.block_while_rebuilding",
+]
+after_request = [
+	"DezPMS.mcp_http.after_request",
+	# every service account call goes in the Agent Action Log
+	"DezPMS.service_accounts.after_request",
+]
+
+# Job Events
+# ----------
+# before_job = ["DezPMS.utils.before_job"]
+# after_job = ["DezPMS.utils.after_job"]
+
+# User Data Protection
+# --------------------
+
+# user_data_fields = [
+# 	{
+# 		"doctype": "{doctype_1}",
+# 		"filter_by": "{filter_by}",
+# 		"redact_fields": ["{field_1}", "{field_2}"],
+# 		"partial": 1,
+# 	},
+# 	{
+# 		"doctype": "{doctype_2}",
+# 		"filter_by": "{filter_by}",
+# 		"partial": 1,
+# 	},
+# 	{
+# 		"doctype": "{doctype_3}",
+# 		"strict": False,
+# 	},
+# 	{
+# 		"doctype": "{doctype_4}"
+# 	}
+# ]
+
+# Authentication and authorization
+# --------------------------------
+
+auth_hooks = [
+	"DezPMS.mcp_http.authenticate",
+	# a service account key reaches only its scoped endpoints (after the
+	# key has been resolved to its user, before the endpoint runs)
+	"DezPMS.service_accounts.enforce_scope",
+]
+
+# Automatically update python controller files with type annotations for this app.
+# export_python_type_annotations = True
+
+# default_log_clearing_doctypes = {
+# 	"Logging DocType Name": 30  # days to retain logs
+# }
+
+# Translation
+# ------------
+# List of apps whose translatable strings should be excluded from this app's translations.
+# ignore_translatable_strings_from = []
+

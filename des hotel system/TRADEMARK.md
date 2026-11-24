@@ -1,0 +1,34 @@
+# DezPMS name and brand
+
+The code is Apache-2.0: you may use, change, host and sell it under that
+license. The name "DezPMS", "DezPMS PMS", "DezPMS Agent" and the DezPMS mark
+(see [`branding/`](branding/README.md)) are not part of that license. This
+page says how to use them, in the same spirit as Frappe and ERPNext.
+
+## Fine without asking
+
+- Running DezPMS for your own hotels, or for clients, and saying so:
+  "runs on DezPMS PMS", "DezPMS implementation by Example Co".
+- Putting a hotel's or a partner's own logo and name in DezPMS's settings.
+  DezPMS shows them on screen, bills and emails next to its own name.
+- Writing about DezPMS, teaching it, and linking to it with the mark.
+- Shipping the unmodified DezPMS mark with an unmodified or patched release.
+
+## Needs a different name
+
+- A fork you distribute or offer as a service with changes we did not
+  ship. Call it something else and say it is based on DezPMS PMS.
+- A product, company or domain name that contains "DezPMS", or a logo that
+  looks like the DezPMS mark.
+- Removing DezPMS's name or mark from the app and presenting it as your
+  own product. Apache-2.0 lets you do that in your own fork; it does not
+  let that fork use the DezPMS name.
+
+## Not allowed
+
+- Implying that you are the DezPMS project, or that we certify, endorse or
+  support your build or service when we do not.
+
+Implementing DezPMS for hotels and want to be listed as a partner, or not
+sure whether a use is fine? Open an issue or write to the maintainers
+listed in [README.md](README.md).

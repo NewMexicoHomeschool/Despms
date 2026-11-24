@@ -1,0 +1,278 @@
+"""Allocation agent (ORION): give every unassigned arrival the right room.
+
+This is agent-native, not a rules engine bolted on: ORION reads each guest's
+free-text wishes (special requests + guest profile notes) and the concrete
+attributes of the free rooms, then proposes the best fit - VIPs to the best
+room, "lake view" to a lake-view room, "high floor" to the top, a group kept
+together. Proposals flow through the autonomy gate, so a manager can let ORION
+assign the obvious ones and approve the judgement calls. A human clicking
+"Auto-assign" on the tape chart runs the same logic with their own authority.
+
+The scorer is deterministic and testable; when an OpenAI key is configured it
+can be layered on top, but the hotel is never blocked on a model being up."""
+
+import frappe
+
+from DezPMS.authz import require_roles
+
+# free-text preference cues -> how they score a candidate room
+_VIEW_WORDS = ("view", "lake", "sea", "ocean", "pool", "garden", "city",
+               "mountain", "hill", "beach", "river")
+_HIGH_WORDS = ("high floor", "higher floor", "top floor", "upper floor",
+               "upper", "highest")
+_LOW_WORDS = ("ground floor", "low floor", "lower floor", "ground-floor",
+              "no stairs", "accessible")
+_ACCESS_WORDS = ("accessible", "wheelchair", "disabled access", "mobility")
+_BED_WORDS = ("king", "queen", "twin", "double", "single")
+_QUIET_WORDS = ("quiet", "corner", "away from", "peaceful", "no noise")
+
+
+def _room_pool(property: str):
+	"""Every room with the attributes allocation cares about, keyed by name."""
+	rooms = frappe.db.sql(
+		"""
+		SELECT r.name, r.room_number, r.floor, r.room_type, r.accessible,
+		       r.connects_to, rt.room_type_name, rt.room_view, rt.bed_type
+		FROM `tabRoom` r
+		LEFT JOIN `tabRoom Type` rt ON rt.name = r.room_type
+		WHERE r.property = %(p)s
+		""", {"p": property}, as_dict=True)
+	floors = [int(r.floor) for r in rooms if _as_int(r.floor) is not None]
+	return rooms, (max(floors) if floors else None), (min(floors) if floors else None)
+
+
+def _as_int(v):
+	try:
+		return int(str(v).strip())
+	except (ValueError, TypeError, AttributeError):
+		return None
+
+
+def _score(prefs: str, vip: bool, room: dict, max_floor, min_floor):
+	"""Score how well a free room fits the guest's wishes; return (score, why)."""
+	p = (prefs or "").lower()
+	score = 0.0
+	why = []
+
+	view = (room.get("room_view") or "").lower()
+	if any(w in p for w in _VIEW_WORDS):
+		if view and view != "standard" and (view in p or "view" in p):
+			score += 3
+			why.append(f"{room['room_view']} view")
+
+	fl = _as_int(room.get("floor"))
+	if any(w in p for w in _HIGH_WORDS) and fl is not None and fl == max_floor:
+		score += 2
+		why.append("top floor")
+	if any(w in p for w in _LOW_WORDS) and fl is not None and fl == min_floor:
+		score += 2
+		why.append("ground floor")
+
+	if room.get("accessible") and any(w in p for w in _ACCESS_WORDS):
+		score += 3
+		why.append("accessible room")
+
+	bed = (room.get("bed_type") or "").lower()
+	for w in _BED_WORDS:
+		if w in p and w in bed:
+			score += 2
+			why.append(f"{room['bed_type']} bed")
+			break
+
+	if any(w in p for w in _QUIET_WORDS):
+		# quieter rooms tend to sit at the far end of the corridor
+		score += 0.5
+		why.append("quieter end")
+
+	if vip:
+		# nudge VIPs toward the higher room numbers (usually the better rooms)
+		score += (_as_int(room.get("room_number")) or 0) / 100000.0
+		why.append("VIP - best available")
+
+	return score, why
+
+
+@frappe.whitelist()
+@require_roles("Front Desk", "Revenue Manager", "DezPMS Agent")
+def suggest_allocation(property: str, date: str | None = None):
+	"""Propose a room for every unassigned arrival on `date`. No mutation."""
+	from frappe.utils import nowdate
+
+	from DezPMS.api import available_rooms
+
+	d = date or nowdate()
+	arrivals = frappe.get_all(
+		"Reservation",
+		filters={"property": property, "status": "Confirmed",
+		         "check_in_date": d, "room": ("in", ["", None])},
+		fields=["name", "guest", "guest_name", "room_type", "check_in_date",
+		        "check_out_date", "special_requests", "group_booking",
+		        "is_day_use", "needs_accessible", "needs_connecting"],
+		order_by="booking_type desc, creation asc")
+
+	# batch the guest lookups (vip + notes)
+	gnames = [a.guest for a in arrivals if a.guest]
+	gmeta = {g.name: g for g in frappe.get_all(
+		"Guest", filters={"name": ("in", gnames or [""])},
+		fields=["name", "vip", "guest_notes"])} if gnames else {}
+
+	pool, _max_floor, _min_floor = _room_pool(property)
+	by_name = {r.name: r for r in pool}
+
+	# rooms already handed out in this pass, so two arrivals never collide
+	taken: set[str] = set()
+	proposals, unfittable = [], []
+
+	def free_for(a):
+		# the room is wanted today: one whose guest has not checked out yet
+		# is not on offer (ready_now), even on that guest's departure date
+		free = available_rooms(property, a.room_type, a.check_in_date,
+		                       a.check_out_date, group_booking=a.group_booking,
+		                       ready_now=1)
+		cands = [by_name[r["name"]] for r in free
+		         if r["name"] in by_name and r["name"] not in taken]
+		if a.needs_accessible:
+			# a need, not a wish: only accessible rooms, when there is one
+			cands = [r for r in cands if r.accessible] or cands
+		return cands
+
+	paired = _connecting_pairs(arrivals, free_for, taken)
+	for a in arrivals:
+		cands = free_for(a)
+		if a.name in paired:
+			room, partner = paired[a.name]
+			cands = [room] + [r for r in cands if r.name != room.name]
+		if not cands:
+			unfittable.append({"reservation": a.name, "guest_name": a.guest_name,
+			                   "room_type": a.room_type,
+			                   "reason": "No free room of this type"})
+			continue
+
+		g = gmeta.get(a.guest)
+		vip = bool(g and g.vip)
+		prefs = " ".join(filter(None, [a.special_requests,  # nosemgrep: frappe-no-functional-code -- filter(None, ...) drops empty parts; equivalent to a comprehension
+		                               g.guest_notes if g else None]))
+		# high/low floor is relative to the rooms actually on offer for this type
+		cfloors = [_as_int(r.get("floor")) for r in cands
+		           if _as_int(r.get("floor")) is not None]
+		cmax = max(cfloors) if cfloors else None
+		cmin = min(cfloors) if cfloors else None
+		scored = sorted(
+			((_score(prefs, vip, r, cmax, cmin), r) for r in cands),
+			key=lambda x: (x[0][0], -(_as_int(x[1].get("room_number")) or 0)),
+			reverse=True)
+		(best_score, why), room = scored[0]
+		if a.name in paired:
+			room, partner = paired[a.name]
+			best_score, why = _score(prefs, vip, room, cmax, cmin)
+			why = [f"connects to {partner}"] + why
+		if a.needs_accessible and not room.accessible:
+			why = ["no accessible room free"] + why
+		taken.add(room.name)
+
+		# a real choice (>1 candidate) or a preference/VIP match => needs a look
+		needs_review = vip or best_score > 0 or len(cands) > 1
+		proposals.append({
+			"reservation": a.name,
+			"guest_name": a.guest_name,
+			"vip": 1 if vip else 0,
+			"room_type_name": room.get("room_type_name") or a.room_type,
+			"suggested_room": room.name,
+			"room_number": room.get("room_number"),
+			"why": ", ".join(why) if why else "First free room of the type",
+			"alternatives": len(cands) - 1,
+			"needs_review": 1 if needs_review else 0,
+			"prefs": prefs.strip(),
+		})
+
+	return {"date": str(d), "proposals": proposals, "unfittable": unfittable}
+
+
+def _connecting_pairs(arrivals, free_for, taken: set[str]) -> dict:
+	"""Stays that asked for connecting rooms (#536), two at a time within a
+	group booking (or the same guest): give each pair two free rooms that
+	connect, one of each stay's type. Returns {reservation: (room, partner
+	room number)}; a pair with no connecting rooms free is left to the
+	normal pick. The rooms are marked taken."""
+	out: dict = {}
+	waiting: dict[str, list] = {}
+	for a in arrivals:
+		if a.needs_connecting:
+			waiting.setdefault(a.group_booking or a.guest or a.name, []).append(a)
+	for stays in waiting.values():
+		for a, b in zip(stays[::2], stays[1::2]):  # noqa: B905 - an odd one out stays unpaired
+			b_free = {r.name: r for r in free_for(b)}
+			pair = next(((ra, b_free[ra.connects_to]) for ra in free_for(a)
+			             if ra.connects_to in b_free and ra.connects_to != ra.name), None)
+			if not pair:
+				continue
+			ra, rb = pair
+			out[a.name] = (ra, rb.room_number)
+			out[b.name] = (rb, ra.room_number)
+			taken.update((ra.name, rb.name))
+	return out
+
+
+@frappe.whitelist(methods=["POST"])
+@require_roles("Front Desk", "Revenue Manager", "DezPMS Agent")
+def apply_allocation(property: str, assignments):
+	"""Assign the proposed rooms - run by a person from the tape chart, or by
+	an AI client on their behalf. Every pair is checked again before it is
+	written: the stay is a confirmed one at this property still without a
+	room, and the room is of the booked type and free and ready for those
+	nights (the same available_rooms rule the suggestion used). Pairs that
+	fail are returned in `skipped` with the reason. A pair already in place
+	is skipped too, so repeating the call changes nothing. Each assignment is
+	recorded in the action log."""
+	if isinstance(assignments, str):
+		assignments = frappe.parse_json(assignments)
+
+	from DezPMS.api import available_rooms
+	from DezPMS.savings import log_action
+	executed, skipped = [], []
+	taken: set[str] = set()
+	for a in assignments or []:
+		res, room = a.get("reservation"), a.get("room") or a.get("suggested_room")
+		if not (res and room):
+			skipped.append({"reservation": res, "room": room,
+			                "reason": "Needs a reservation and a room"})
+			continue
+		doc = frappe.db.get_value(
+			"Reservation", res,
+			["property", "room", "status", "room_type", "check_in_date",
+			 "check_out_date", "group_booking"], as_dict=True)
+		why = None
+		if not doc or doc.property != property:
+			why = "Not a booking at this property"
+		elif doc.room == room:
+			why = "Already in that room"
+		elif doc.status != "Confirmed":
+			why = f"The stay is {doc.status}, not waiting for arrival"
+		elif doc.room:
+			why = "The stay already has a room; use a room move to change it"
+		elif room in taken:
+			why = "That room was just given to another arrival"
+		else:
+			r = frappe.db.get_value("Room", room, ["property", "room_type"], as_dict=True)
+			if not r or r.property != property:
+				why = "Not a room at this property"
+			elif r.room_type != doc.room_type:
+				why = "That room is another type; use a room move so the price is shown first"
+			else:
+				free = available_rooms(property, doc.room_type, doc.check_in_date,
+				                       doc.check_out_date, group_booking=doc.group_booking,
+				                       ready_now=1)
+				if room not in {f["name"] for f in free}:
+					why = "That room is no longer free or ready for these nights"
+		if why:
+			skipped.append({"reservation": res, "room": room, "reason": why})
+			continue
+		frappe.db.set_value("Reservation", res, "room", room)
+		taken.add(room)
+		log_action("allocate_room", "Reservation", res, property,
+		           minutes_saved=2,
+		           rationale=f"→ room {room}. {a.get('why') or ''}".strip())
+		executed.append({"reservation": res, "room": room})
+
+	frappe.db.commit()  # nosemgrep: frappe-manual-commit -- persists the completed operation before returning to an external/public caller; reviewed as intentional
+	return {"executed": executed, "skipped": skipped}

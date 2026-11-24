@@ -1,0 +1,41 @@
+[pre_model_sync]
+# Patches added in this section will be executed before doctypes are migrated
+# Read docs to understand patches: https://frappeframework.com/docs/v14/user/en/database-migrations
+
+[post_model_sync]
+# Patches added in this section will be executed after doctypes are migrated
+DezPMS.patches.v23.backfill_action_log_approval_status
+DezPMS.patches.v24.split_actor_from_agent_name
+DezPMS.patches.v25.backfill_property_country
+DezPMS.patches.v26.set_site_favicon
+DezPMS.patches.v27.backfill_sellable_units
+DezPMS.patches.v28.backfill_property_kind
+DezPMS.patches.v29.backfill_booking_mode
+DezPMS.patches.v30.ensure_turnover_profiles
+DezPMS.patches.v31.backfill_listing_slugs
+DezPMS.patches.v32.seed_cashier_ledger
+DezPMS.patches.v33.seed_banquet_checklists
+DezPMS.patches.v34.keep_existing_privacy_settings
+DezPMS.patches.v34.keep_access_logs_a_year
+DezPMS.patches.v35.hosting_enquiry_system_manager_only
+DezPMS.patches.v36.move_kitchen_ledger_off_stock_ledger_entry
+DezPMS.patches.v37.move_corporate_clients_off_company
+DezPMS.patches.v38.keep_existing_messages
+DezPMS.patches.v39.backfill_company_credit_guest_ledger
+DezPMS.patches.v40.backfill_charge_ledger
+DezPMS.patches.v40.apply_city_ledger_payments
+DezPMS.patches.v40.lock_confirmed_night_rates
+DezPMS.patches.v41.move_advances_to_guest_ledger
+DezPMS.patches.v42.outlet_kot_mode
+DezPMS.patches.v42.credit_days_use_property_default
+DezPMS.patches.v42.backfill_city_ledger_due_dates
+DezPMS.patches.v43.seed_petty_cash_floats
+DezPMS.patches.v43.backfill_checkin_record
+DezPMS.patches.v44.grant_mcp_manage_to_connected_users
+DezPMS.patches.v45.fix_folio_payment_currency
+DezPMS.patches.v46.ledger_custom_perms_readonly
+DezPMS.patches.v46.backfill_pos_order_business_date
+DezPMS.patches.v46.backfill_property_short_code
+DezPMS.patches.v47.report_duplicate_ota_refs
+DezPMS.patches.v47.create_floors_from_rooms
+DezPMS.patches.v47.move_policy_fee_advances_to_guest_ledger
